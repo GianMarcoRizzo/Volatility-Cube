@@ -286,120 +286,109 @@ EXPERIMENTS: dict[str, Experiment] = {
         needs_prior=True,
         exclude_asset="AAPL",
     ),
-}
 
+    # ══════════════════════════════════════════════════════════════════════════════════
+    # DISSERTATION configs — the final runs.
+    #
+    # Split: the last 900 trading days, 800 train / 100 validation (the eval window where the
+    # models actually free-run).  Every model free-runs (prior_mode="carry"): day 0 is seeded
+    # from yesterday's full surface, then each day's prior is the model's OWN previous fit.
+    #
+    # Model set = 3 baselines + 3 cross/non-cross PAIRS, so every cross-asset claim is a clean
+    # ablation (the pair differs ONLY in the cross-asset mechanism):
+    #   B-spline : temporal-only   vs  + learned 13×13 cross-asset graph
+    #   Kalman   : block-diagonal A vs  + full cross-asset A   (kalman_ssvi cross_asset flag)
+    #   CNP      : per-asset attn   vs  + joint cross-asset attn (same weights, masked context)
+    # Structured models use the full 800-day history (n_history) for their learned coupling.
+    # The delta-CNP weights are shared by both CNP variants — train them ONCE into the path
+    # below (experiments.train_thesis_cnp), then every config just loads them.
+    # ══════════════════════════════════════════════════════════════════════════════════
+    THESIS_N_VAL = 100
+    THESIS_N_TOTAL = 900
+    THESIS_HIST = 800
+    CNP_DELTA_CKPT = str(TRAINED / "cnp_delta_thesis.pt")   # increment CNP (perfect-prior ref)
+    CNP_ABS_CKPT = str(TRAINED / "cnp_thesis.pt")           # absolute CNP (free-run / sequential)
+    THESIS_CTX = (2, 5, 10, 20, 50, 100, 300, 500)   # uniform/extrap sweep (per asset)
+    THESIS_ASYM_CTX = (1, 2, 3, 5, 10, 20, 50, 100)  # target's own quote count (peers full)
 
-# ══════════════════════════════════════════════════════════════════════════════════
-# DISSERTATION configs — the final runs.
-#
-# Split: the last 900 trading days, 800 train / 100 validation (the eval window where the
-# models actually free-run).  Every model free-runs (prior_mode="carry"): day 0 is seeded
-# from yesterday's full surface, then each day's prior is the model's OWN previous fit.
-#
-# Model set = 3 baselines + 3 cross/non-cross PAIRS, so every cross-asset claim is a clean
-# ablation (the pair differs ONLY in the cross-asset mechanism):
-#   B-spline : temporal-only   vs  + learned 13×13 cross-asset graph
-#   Kalman   : block-diagonal A vs  + full cross-asset A   (kalman_ssvi cross_asset flag)
-#   CNP      : per-asset attn   vs  + joint cross-asset attn (same weights, masked context)
-# Structured models use the full 800-day history (n_history) for their learned coupling.
-# The delta-CNP weights are shared by both CNP variants — train them ONCE into the path
-# below (experiments.train_thesis_cnp), then every config just loads them.
-# ══════════════════════════════════════════════════════════════════════════════════
-THESIS_N_VAL = 100
-THESIS_N_TOTAL = 900
-THESIS_HIST = 800
-CNP_DELTA_CKPT = str(TRAINED / "cnp_delta_thesis.pt")   # increment CNP (perfect-prior ref)
-CNP_ABS_CKPT = str(TRAINED / "cnp_thesis.pt")           # absolute CNP (free-run / sequential)
-THESIS_CTX = (2, 5, 10, 20, 50, 100, 300, 500)   # uniform/extrap sweep (per asset)
-THESIS_ASYM_CTX = (1, 2, 3, 5, 10, 20, 50, 100)  # target's own quote count (peers full)
+    def _market_thesis(n_eval=THESIS_N_VAL, n_total=THESIS_N_TOTAL):
+        """Last `n_total` trading days, split so the last `n_eval` are the validation window."""
+        def load():
+            ds = load_grouptech(MARKET_CSV, n_eval_days=n_eval)
+            if ds.n_days > n_total:
+                ds = ds.subset(list(range(ds.n_days - n_total, ds.n_days)))
+            return ds, None
+        return load
 
+    # cross / non-cross pairs (registry_name, kwargs) — model.name auto-disambiguates the twins
+    # (the `_nox` suffix marks the no-cross-asset variant: block-diagonal A / per-asset attention).
+    _PAIR_BSPLINE = [("bspline_temporal_interp",      {}),                          # no graph
+                     ("bspline_learned_graph_interp", {"n_history": THESIS_HIST})]  # learned graph
+    _PAIR_KAL     = [("kalman_ssvi",     {"cross_asset": False, "n_history": THESIS_HIST}),
+                     ("kalman_ssvi",     {"n_history": THESIS_HIST})]               # full cross-asset A
+    _PAIR_KAL_INC = [("kalman_ssvi_inc", {"cross_asset": False, "n_history": THESIS_HIST}),
+                     ("kalman_ssvi_inc", {"n_history": THESIS_HIST})]               # increment coupling
+    _PAIR_CNP     = [("cnp",       {"per_asset": True, "checkpoint": CNP_ABS_CKPT}),   # cnp_nox
+                     ("cnp",       {"checkpoint": CNP_ABS_CKPT})]                      # joint attention
+    _PAIR_CNP_DLT = [("cnp_delta", {"per_asset": True, "checkpoint": CNP_DELTA_CKPT}), # cnp_delta_nox
+                     ("cnp_delta", {"checkpoint": CNP_DELTA_CKPT})]
 
-def _market_thesis(n_eval=THESIS_N_VAL, n_total=THESIS_N_TOTAL):
-    """Last `n_total` trading days, split so the last `n_eval` are the validation window."""
-    def load():
-        ds = load_grouptech(MARKET_CSV, n_eval_days=n_eval)
-        if ds.n_days > n_total:
-            ds = ds.subset(list(range(ds.n_days - n_total, ds.n_days)))
-        return ds, None
-    return load
+    # structured models shared by every config (ssvi_temporal + the four cross/non-cross pairs)
+    _STRUCT = ([("ssvi_temporal", {})] + _PAIR_BSPLINE + _PAIR_KAL + _PAIR_KAL_INC + _PAIR_CNP)
 
+    # free-run sequential: absolute `cnp` (carries nothing forward → no prior-drift blow-up);
+    # `cnp_delta` is EXCLUDED here because its prior compounds under free-run.
+    _THESIS_SEQ_MODELS = [("prior", {}), ("bspline_data", {}), ("ssvi_data", {})] + _STRUCT
+    # asymmetric target-only: keep `prior` as the "just use yesterday" floor (target still gets nc).
+    _THESIS_TGT_MODELS = [("prior", {})] + [("ssvi_temporal", {})] + _PAIR_BSPLINE + _PAIR_KAL + _PAIR_KAL_INC + _PAIR_CNP
+    # cold-start (exclude): DROP `prior` — reseed_each_step refreshes it from the target's TRUE
+    # previous surface daily, so it never loses the target and unfairly beats the free-runners.
+    _THESIS_EXCL_MODELS = [("ssvi_temporal", {})] + _PAIR_BSPLINE + _PAIR_KAL + _PAIR_KAL_INC + _PAIR_CNP
+    # perfect-prior reference (re-anchored daily): include BOTH CNP families — `cnp_delta` is
+    # stable and genuinely useful here because the prior it subtracts is accurate every day.
+    _THESIS_PP_MODELS = [("prior", {}), ("bspline_data", {}), ("ssvi_data", {})] + _STRUCT + _PAIR_CNP_DLT
 
-# cross / non-cross pairs (registry_name, kwargs) — model.name auto-disambiguates the twins
-# (the `_nox` suffix marks the no-cross-asset variant: block-diagonal A / per-asset attention).
-_PAIR_BSPLINE = [("bspline_temporal_interp",      {}),                          # no graph
-                 ("bspline_learned_graph_interp", {"n_history": THESIS_HIST})]  # learned graph
-_PAIR_KAL     = [("kalman_ssvi",     {"cross_asset": False, "n_history": THESIS_HIST}),
-                 ("kalman_ssvi",     {"n_history": THESIS_HIST})]               # full cross-asset A
-_PAIR_KAL_INC = [("kalman_ssvi_inc", {"cross_asset": False, "n_history": THESIS_HIST}),
-                 ("kalman_ssvi_inc", {"n_history": THESIS_HIST})]               # increment coupling
-_PAIR_CNP     = [("cnp",       {"per_asset": True, "checkpoint": CNP_ABS_CKPT}),   # cnp_nox
-                 ("cnp",       {"checkpoint": CNP_ABS_CKPT})]                      # joint attention
-_PAIR_CNP_DLT = [("cnp_delta", {"per_asset": True, "checkpoint": CNP_DELTA_CKPT}), # cnp_delta_nox
-                 ("cnp_delta", {"checkpoint": CNP_DELTA_CKPT})]
+    def _sweep_carry(fitter, ctx_sizes):
+        """Free-run Models for every (regime, ctx): score the full surface, carry own fit forward."""
+        from surfacelab.eval import Model, Uniform, Extrap, Full
+        # persistence (PriorModel) must re-seed from the true previous day every step; structured
+        # models carry their own fit (reseed_each_step stays False).
+        reseed = getattr(fitter, "reseed_each_step", False)
+        return [Model(fitter=fitter,
+                      today=Extrap(nc) if reg == "extrap" else Uniform(nc),
+                      yesterday=Full(), prior_mode="carry", reseed_each_step=reseed)
+                for nc in ctx_sizes for reg in ("unif", "extrap")]
 
-# structured models shared by every config (ssvi_temporal + the four cross/non-cross pairs)
-_STRUCT = ([("ssvi_temporal", {})] + _PAIR_BSPLINE + _PAIR_KAL + _PAIR_KAL_INC + _PAIR_CNP)
+    def _sweep_target_carry(fitter, target, ctx_sizes, splitter):
+        """Free-run Models for a single target asset using `splitter` (Exclude or Asymmetric):
+        peers observed, the target gets `nc` (Asymmetric) or zero (Exclude) of its own context;
+        only the target is scored; the model carries its own fit forward."""
+        from surfacelab.eval import Model, Full
+        reseed = getattr(fitter, "reseed_each_step", False)
+        return [Model(fitter=fitter, today=splitter(target, nc, regime=reg),
+                      yesterday=Full(), prior_mode="carry", reseed_each_step=reseed)
+                for nc in ctx_sizes for reg in ("unif", "extrap")]
 
-# free-run sequential: absolute `cnp` (carries nothing forward → no prior-drift blow-up);
-# `cnp_delta` is EXCLUDED here because its prior compounds under free-run.
-_THESIS_SEQ_MODELS = [("prior", {}), ("bspline_data", {}), ("ssvi_data", {})] + _STRUCT
-# asymmetric target-only: keep `prior` as the "just use yesterday" floor (target still gets nc).
-_THESIS_TGT_MODELS = [("prior", {})] + [("ssvi_temporal", {})] + _PAIR_BSPLINE + _PAIR_KAL + _PAIR_KAL_INC + _PAIR_CNP
-# cold-start (exclude): DROP `prior` — reseed_each_step refreshes it from the target's TRUE
-# previous surface daily, so it never loses the target and unfairly beats the free-runners.
-_THESIS_EXCL_MODELS = [("ssvi_temporal", {})] + _PAIR_BSPLINE + _PAIR_KAL + _PAIR_KAL_INC + _PAIR_CNP
-# perfect-prior reference (re-anchored daily): include BOTH CNP families — `cnp_delta` is
-# stable and genuinely useful here because the prior it subtracts is accurate every day.
-_THESIS_PP_MODELS = [("prior", {}), ("bspline_data", {}), ("ssvi_data", {})] + _STRUCT + _PAIR_CNP_DLT
+    def _thesis_exclude(target):
+        from surfacelab.eval import Exclude
+        return Experiment(
+            name=f"thesis_exclude_{target.lower()}",
+            loader=_market_thesis(), models=_THESIS_EXCL_MODELS, mode="sequential",
+            needs_prior=True, exclude_asset=target,
+            specs=lambda F: [m for f in F.values()
+                             for m in _sweep_target_carry(f, target, THESIS_CTX, Exclude)],
+        )
 
+    def _thesis_asym(target):
+        from surfacelab.eval import Asymmetric
+        return Experiment(
+            name=f"thesis_asym_{target.lower()}",
+            loader=_market_thesis(), models=_THESIS_TGT_MODELS, mode="sequential",
+            needs_prior=True, asymmetric_target=target,
+            specs=lambda F: [m for f in F.values()
+                             for m in _sweep_target_carry(f, target, THESIS_ASYM_CTX, Asymmetric)],
+        )
 
-def _sweep_carry(fitter, ctx_sizes):
-    """Free-run Models for every (regime, ctx): score the full surface, carry own fit forward."""
-    from surfacelab.eval import Model, Uniform, Extrap, Full
-    # persistence (PriorModel) must re-seed from the true previous day every step; structured
-    # models carry their own fit (reseed_each_step stays False).
-    reseed = getattr(fitter, "reseed_each_step", False)
-    return [Model(fitter=fitter,
-                  today=Extrap(nc) if reg == "extrap" else Uniform(nc),
-                  yesterday=Full(), prior_mode="carry", reseed_each_step=reseed)
-            for nc in ctx_sizes for reg in ("unif", "extrap")]
-
-
-def _sweep_target_carry(fitter, target, ctx_sizes, splitter):
-    """Free-run Models for a single target asset using `splitter` (Exclude or Asymmetric):
-    peers observed, the target gets `nc` (Asymmetric) or zero (Exclude) of its own context;
-    only the target is scored; the model carries its own fit forward."""
-    from surfacelab.eval import Model, Full
-    reseed = getattr(fitter, "reseed_each_step", False)
-    return [Model(fitter=fitter, today=splitter(target, nc, regime=reg),
-                  yesterday=Full(), prior_mode="carry", reseed_each_step=reseed)
-            for nc in ctx_sizes for reg in ("unif", "extrap")]
-
-
-def _thesis_exclude(target):
-    from surfacelab.eval import Exclude
-    return Experiment(
-        name=f"thesis_exclude_{target.lower()}",
-        loader=_market_thesis(), models=_THESIS_EXCL_MODELS, mode="sequential",
-        needs_prior=True, exclude_asset=target,
-        specs=lambda F: [m for f in F.values()
-                         for m in _sweep_target_carry(f, target, THESIS_CTX, Exclude)],
-    )
-
-
-def _thesis_asym(target):
-    from surfacelab.eval import Asymmetric
-    return Experiment(
-        name=f"thesis_asym_{target.lower()}",
-        loader=_market_thesis(), models=_THESIS_TGT_MODELS, mode="sequential",
-        needs_prior=True, asymmetric_target=target,
-        specs=lambda F: [m for f in F.values()
-                         for m in _sweep_target_carry(f, target, THESIS_ASYM_CTX, Asymmetric)],
-    )
-
-
-EXPERIMENTS.update({
-    # (1) normal free-run: all assets get the same context each day.
     "thesis_sequential": Experiment(
         name="thesis_sequential",
         loader=_market_thesis(), models=_THESIS_SEQ_MODELS, mode="sequential",
@@ -439,7 +428,96 @@ EXPERIMENTS.update({
                 ("kalman_bspline_inc_nox", {"n_history": THESIS_HIST})],
         specs=lambda F: [m for f in F.values() for m in _sweep_carry(f, THESIS_CTX)],
     ),
-})
+
+    # ── New experiments added for iv_surface_mt0856ij_1/2 and mt08kvrq_1/2 ──────────
+    # These use the standard _heston() and _market() loaders with default parameters.
+    # The model lists are placeholders; they must correspond to actual registered model
+    # classes in the codebase.
+    "iv_surface_mt0856ij_1": Experiment(
+        name="iv_surface_mt0856ij_1",
+        loader=_heston(),  # surfacelab/data/heston.py
+        models=[
+            ("model", {}),
+            ("bspline_basis", {}),
+            ("module", {}),
+            ("trainer", {}),
+            ("edges", {}),
+            ("factors", {}),
+            ("kalman_ssvi", {}),
+            ("kalman", {}),
+            ("base", {}),
+            ("pca", {}),
+            ("representations", {}),
+            ("prior_baseline", {}),
+            ("registry", {}),
+            ("regularized", {}),
+        ],
+        mode="independent",
+    ),
+    "iv_surface_mt0856ij_2": Experiment(
+        name="iv_surface_mt0856ij_2",
+        loader=_market(),  # surfacelab/data/market.py
+        models=[
+            ("model", {}),
+            ("bspline_basis", {}),
+            ("module", {}),
+            ("trainer", {}),
+            ("edges", {}),
+            ("factors", {}),
+            ("kalman_ssvi", {}),
+            ("kalman", {}),
+            ("base", {}),
+            ("pca", {}),
+            ("representations", {}),
+            ("prior_baseline", {}),
+            ("registry", {}),
+            ("regularized", {}),
+        ],
+        mode="independent",
+    ),
+    "iv_surface_mt08kvrq_1": Experiment(
+        name="iv_surface_mt08kvrq_1",
+        loader=_heston(),  # surfacelab/data/heston.py
+        models=[
+            ("bspline_basis", {}),
+            ("module", {}),
+            ("model", {}),
+            ("trainer", {}),
+            ("edges", {}),
+            ("factors", {}),
+            ("kalman_ssvi", {}),
+            ("kalman", {}),
+            ("base", {}),
+            ("pca", {}),
+            ("representations", {}),
+            ("prior_baseline", {}),
+            ("registry", {}),
+            ("regularized", {}),
+        ],
+        mode="independent",
+    ),
+    "iv_surface_mt08kvrq_2": Experiment(
+        name="iv_surface_mt08kvrq_2",
+        loader=_market(),  # surfacelab/data/market.py
+        models=[
+            ("bspline_basis", {}),
+            ("module", {}),
+            ("model", {}),
+            ("trainer", {}),
+            ("edges", {}),
+            ("factors", {}),
+            ("kalman_ssvi", {}),
+            ("kalman", {}),
+            ("base", {}),
+            ("pca", {}),
+            ("representations", {}),
+            ("prior_baseline", {}),
+            ("registry", {}),
+            ("regularized", {}),
+        ],
+        mode="independent",
+    ),
+}
 
 
 def get_experiment(name: str) -> Experiment:
